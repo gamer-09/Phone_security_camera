@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#04070d" />
+  <link rel="icon" href="data:," />
+  <title>SEC-CAM // VIEWER</title>
+  <link rel="stylesheet" href="/css/style.css" />
+</head>
+<body class="viewer-ui">
+  <div class="app-shell">
+
+    <header class="topbar">
+      <div class="brand">
+        <i class="dot"></i>
+        <span>SEC-CAM</span>
+        <span class="tag">VIEWER</span>
+        <span class="tag relay" id="relayBadge" hidden>RELAY</span>
+        <span class="tag offline" id="offlineBadge" hidden>OFFLINE</span>
+      </div>
+      <div class="pill standby" id="pill">STANDBY</div>
+      <div class="hud-cluster">
+        <div class="hud-chip" id="rtt">RTT --</div>
+        <div class="hud-chip" id="fps">FPS --</div>
+        <div class="hud-chip" id="bwChip" title="Incoming bandwidth / packet loss">BW --</div>
+        <div class="hud-chip" id="qualityChip" title="Adaptive stream quality">Q AUTO · --</div>
+        <div class="hud-chip" id="clock">--:--:--</div>
+        <div class="hud-chip" id="motionChip">MOTION OFF</div>
+      </div>
+    </header>
+
+    <main class="stage-wrap">
+      <div class="stage" id="stage">
+        <video id="feed" autoplay playsinline muted></video>
+        <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+        <div class="overlay vignette"></div>
+        <div class="overlay scanlines"></div>
+        <canvas id="motionOverlay" aria-hidden="true"></canvas>
+        <div class="motion-track" id="motionTrack"><div class="motion-bar" id="motionBar"></div></div>
+
+        <div class="rec-badge" id="recBadge"><i class="rec-dot"></i>REC</div>
+        <div class="stage-hud" id="stageHud">CAM LINKED · --×--</div>
+
+        <div class="unmute-card hidden" id="unmuteCard">
+          <button class="btn primary" id="btnUnmute">
+            <svg viewBox="0 0 24 24"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M23 9l-6 6M17 9l6 6"/></svg>
+            ENABLE AUDIO
+          </button>
+        </div>
+
+        <div class="link-lost hidden" id="linkLost" aria-live="assertive">
+          <div class="radar small"><i></i></div>
+          <h3>SIGNAL LOST</h3>
+          <div class="t" id="linkLostT">00:45</div>
+          <p class="msg">RECONNECTING — phone is re-linking automatically</p>
+          <p class="sub">Last frame held. The camera resumes on its own.</p>
+        </div>
+
+        <div class="wait-overlay" id="waitOverlay">
+          <div class="radar"><i></i></div>
+          <h2>AWAITING CAMERA LINK</h2>
+          <p class="sub">Scan this QR with your phone's camera app, then tap GO LIVE</p>
+
+          <div class="qr-card">
+            <img id="qr" alt="QR code — phone unit link" />
+            <div class="qr-meta">
+              <div class="k">PHONE URL</div>
+              <div class="v" id="phoneUrl">…</div>
+              <div class="k">VIEWER ID</div>
+              <div class="v mono" id="peerId">…</div>
+              <div class="k">PIN</div>
+              <div class="v mono" id="pin">…</div>
+            </div>
+          </div>
+
+          <button class="btn ghost" id="btnCopy">⧉ COPY LINK</button>
+        </div>
+      </div>
+    </main>
+
+    <footer class="dock">
+      <button class="btn ghost" id="btnReconnect">↻ RECONNECT</button>
+      <button class="btn" id="btnSnapshot">▣ SNAPSHOT</button>
+      <button class="btn" id="btnRecord">● RECORD</button>
+      <button class="btn" id="btnPip">⧉ PICTURE-IN-PICTURE</button>
+      <button class="btn" id="btnFs">⛶ FULLSCREEN</button>
+      <button class="btn" id="btnMute">◉ MUTE AUDIO</button>
+      <button class="btn" id="btnMotion">◈ MOTION</button>
+      <label class="ctl-label" for="motionSens">SENS</label>
+      <input type="range" id="motionSens" min="1" max="100" value="45" aria-label="Motion sensitivity" />
+      <span class="sens-val" id="motionSensVal">45</span>
+      <button class="btn" id="btnBeep">♪ BEEP ON</button>
+      <label class="ctl-label" for="segQuality">QUALITY</label>
+      <div class="seg" id="segQuality" title="Stream quality — AUTO adapts to the link">
+        <button type="button" class="on" data-q="auto">AUTO</button>
+        <button type="button" data-q="eco">ECO</button>
+        <button type="button" data-q="med">MED</button>
+        <button type="button" data-q="hd">HD</button>
+      </div>
+      <span class="hint">S snapshot · R record · M mute · F fullscreen · P pip · N motion · AUTO quality</span>
+    </footer>
+  </div>
+
+  <button class="dbg-toggle" id="btnDbg" type="button" title="Toggle diagnostics log">LOG</button>
+  <div class="dbg-panel" id="dbgPanel" hidden>
+    <div class="dbg-head">EVENT LOG <button id="btnDbgClose" type="button" aria-label="Close log">×</button></div>
+    <ul id="dbgList"></ul>
+  </div>
+
+  <div class="toast-wrap"></div>
+
+  <script src="/js/common.js"></script>
+  <script src="/vendor/peerjs.min.js"></script>
+  <script src="/js/viewer.js"></script>
+  <script>
+    // offline-ready: cache the app shell so the viewer opens even while the
+    // server is starting or the network is down (best-effort, never fatal)
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('/sw.js').catch(() => {});
+    }
+  </script>
+</body>
+</html>
