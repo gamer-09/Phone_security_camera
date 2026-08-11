@@ -181,6 +181,11 @@ button { font-family: inherit; }
   border-color: rgba(255, 200, 87, 0.5);
   animation: pulse 1.8s ease-in-out infinite;
 }
+.hud-chip.on {
+  color: var(--lime);
+  border-color: rgba(141, 255, 94, 0.55);
+  text-shadow: 0 0 8px rgba(141, 255, 94, 0.5);
+}
 
 .ctl-label {
   font-size: 10px;
@@ -666,6 +671,109 @@ input[type="range"]::-moz-range-thumb {
   background: rgba(255, 59, 92, 0.1);
   animation: blink 0.8s steps(2) infinite;
 }
+
+/* ----------------------------------------------------------------
+   Night vision + thermal vision
+   ---------------------------------------------------------------- */
+
+/* phosphor-green night vision — viewer feed + phone preview. An SVG
+   gamma-gain filter (the #nvg def in both pages): a flat brightness bump
+   can't recover detail the sensor never captured, so the gamma curve lifts
+   shadows hard (~4×) and then maps luminance onto the classic phosphor
+   green. In total darkness the phone's AUTO TORCH provides real light. */
+#feed.nvg, #preview.nvg {
+  filter: url(#nvg);
+}
+
+/* thermal — the live auto-ranged relative-heat renderer paints its own
+   opaque canvas (sized to the visible feed) instead of a fixed filter */
+#thermalCanvas {
+  position: absolute;
+  z-index: 1;
+  display: none;
+  pointer-events: none;
+}
+#thermalCanvas.on { display: block; }
+
+.th-hud {
+  position: absolute;
+  right: 18px;
+  bottom: 16px;
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 10px;
+  letter-spacing: 2px;
+  color: var(--txt);
+  background: rgba(6, 12, 20, 0.72);
+  border: 1px solid rgba(255, 140, 60, 0.5);
+  border-radius: 8px;
+  padding: 6px 10px;
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  box-shadow: 0 0 12px rgba(255, 140, 60, 0.25);
+}
+.th-hud.hidden { display: none; }
+.th-hud .k { color: var(--dim); }
+.th-hud .min { color: #4a7cff; }
+.th-hud .max { color: #ffd24a; }
+.th-hud .note { color: var(--amber); letter-spacing: 1px; }
+
+.thermal-svg {
+  position: absolute;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+}
+
+#btnTalk.on {
+  color: var(--lime);
+  border-color: rgba(141, 255, 94, 0.7);
+  background: rgba(141, 255, 94, 0.08);
+  box-shadow: 0 0 16px rgba(141, 255, 94, 0.35);
+}
+#btnThermal.on {
+  color: #ffb07c;
+  border-color: rgba(255, 140, 60, 0.7);
+  background: rgba(255, 140, 60, 0.08);
+  box-shadow: 0 0 16px rgba(255, 140, 60, 0.35);
+}
+
+/* phone page — AUTO TORCH: fires the flashlight when night vision engages */
+.btn.auto-torch {
+  font-size: 10px;
+  letter-spacing: 2px;
+  padding: 9px 12px;
+  color: var(--dim);
+  border-color: var(--line);
+}
+.btn.auto-torch.on {
+  color: var(--amber);
+  border-color: rgba(255, 200, 87, 0.65);
+  box-shadow: 0 0 12px rgba(255, 200, 87, 0.3);
+}
+
+/* phone page — tap-to-unlock the viewer's voice if autoplay is blocked */
+.talk-unlock {
+  position: fixed;
+  bottom: 168px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 95;
+  font-family: inherit;
+  font-size: 12px;
+  letter-spacing: 2px;
+  color: var(--txt);
+  background: var(--panel-2);
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  padding: 12px 20px;
+  cursor: pointer;
+  box-shadow: var(--shadow);
+  animation: pulse 1.6s ease-in-out infinite;
+}
+.talk-unlock.hidden { display: none; }
 
 /* ----------------------------------------------------------------
    PHONE PAGE

@@ -138,6 +138,13 @@ window.addEventListener('offline', () => netHandlers.forEach((h) => h(true)));
    engine picks a tier from live WebRTC stats and tells the phone; the phone
    applies it as an encoder bitrate cap + capture constraints — no SDP
    renegotiation needed, so it works mid-call on any network. */
+/* Night-vision thresholds — mean frame luminance (0–255). Hysteresis
+   so the filter never flickers at the boundary: engage below NVG_ON_LVL,
+   disengage only above NVG_OFF_LVL. Both pages use these so the phone's
+   preview and the PC viewer agree on when it's "dark". */
+const NVG_ON_LVL = 22;
+const NVG_OFF_LVL = 34;
+
 const QUALITY_TIERS = [
   { label: 'ECO 240p', w: 426, h: 240, fps: 12, bitrate: 120000 },   // 0
   { label: 'SD 360p', w: 640, h: 360, fps: 15, bitrate: 250000 },    // 1
@@ -146,11 +153,20 @@ const QUALITY_TIERS = [
   { label: 'FHD 1080p', w: 1920, h: 1080, fps: 24, bitrate: 2500000 }, // 4
 ];
 
-/* Manual quality modes (viewer dock): AUTO = adaptive engine; the others
-   force a fixed tier. FHD stays engine-only so a manual choice can never
-   demand more bandwidth than a poor link can carry. */
-const QUALITY_MODES = { auto: -1, eco: 0, med: 2, hd: 3 };
-const QUALITY_START_TIER = 3; // HD 720p default
+/* Manual quality modes (viewer dock): AUTO = adaptive engine; STABLE pins
+   the stream to the gentle SD 360p tier (≈250 kbps) so weak or flaky WiFi
+   adapters are never stressed into dropping the link; the others force a
+   fixed tier. The FHD 1080p tier (index 4) is intentionally unreachable —
+   neither the engine (AUTO_CEIL_TIER) nor any manual mode selects it — so
+   a multi-Mbps burst can never be demanded from a weak link. */
+const QUALITY_MODES = { auto: -1, stable: 1, eco: 0, med: 2, hd: 3 };
+
+/* The AUTO engine starts on SD 480p (gentle on weak WiFi) and never
+   escalates past HD 720p on its own — sustained FHD-class RTP traffic is
+   the fastest way to push a buggy adapter over the edge. If the link still
+   drops, the user pins STABLE mode as a hard cap. */
+const QUALITY_START_TIER = 2; // SD 480p default
+const AUTO_CEIL_TIER = 3;     // HD 720p — AUTO never goes beyond this
 
 const IS_RELAY = isRelay();
 

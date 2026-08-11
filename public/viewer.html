@@ -25,6 +25,7 @@
         <div class="hud-chip" id="fps">FPS --</div>
         <div class="hud-chip" id="bwChip" title="Incoming bandwidth / packet loss">BW --</div>
         <div class="hud-chip" id="qualityChip" title="Adaptive stream quality">Q AUTO · --</div>
+        <div class="hud-chip" id="nvChip" title="Night vision — AUTO switches on when it gets dark">☾ AUTO</div>
         <div class="hud-chip" id="clock">--:--:--</div>
         <div class="hud-chip" id="motionChip">MOTION OFF</div>
       </div>
@@ -37,7 +38,14 @@
         <div class="overlay vignette"></div>
         <div class="overlay scanlines"></div>
         <canvas id="motionOverlay" aria-hidden="true"></canvas>
+        <canvas id="thermalCanvas" aria-hidden="true"></canvas>
         <div class="motion-track" id="motionTrack"><div class="motion-bar" id="motionBar"></div></div>
+        <div class="th-hud hidden" id="thScale" title="Relative heat scale — maps visible-light brightness, NOT real temperature">
+          <span class="k">REL HEAT</span>
+          <span class="min" id="thMin">--</span>
+          <span class="max" id="thMax">--</span>
+          <span class="note" id="thNote"></span>
+        </div>
 
         <div class="rec-badge" id="recBadge"><i class="rec-dot"></i>REC</div>
         <div class="stage-hud" id="stageHud">CAM LINKED · --×--</div>
@@ -86,19 +94,23 @@
       <button class="btn" id="btnPip">⧉ PICTURE-IN-PICTURE</button>
       <button class="btn" id="btnFs">⛶ FULLSCREEN</button>
       <button class="btn" id="btnMute">◉ MUTE AUDIO</button>
+      <button class="btn" id="btnNight" title="Night vision — cycle AUTO / ON / OFF">☾ NIGHT AUTO</button>
+      <button class="btn" id="btnThermal" title="Thermal vision — live auto-ranged relative-heat renderer">♨ THERMAL</button>
+      <button class="btn" id="btnTalk" title="Talk to the phone — your mic plays on its speaker">◉ TALK</button>
       <button class="btn" id="btnMotion">◈ MOTION</button>
       <label class="ctl-label" for="motionSens">SENS</label>
       <input type="range" id="motionSens" min="1" max="100" value="45" aria-label="Motion sensitivity" />
       <span class="sens-val" id="motionSensVal">45</span>
       <button class="btn" id="btnBeep">♪ BEEP ON</button>
       <label class="ctl-label" for="segQuality">QUALITY</label>
-      <div class="seg" id="segQuality" title="Stream quality — AUTO adapts to the link">
+      <div class="seg" id="segQuality" title="Stream quality — AUTO adapts to the link; STABLE pins it to minimal bandwidth (safest for weak WiFi)">
         <button type="button" class="on" data-q="auto">AUTO</button>
         <button type="button" data-q="eco">ECO</button>
         <button type="button" data-q="med">MED</button>
         <button type="button" data-q="hd">HD</button>
+        <button type="button" data-q="stable" title="STABLE — pins the stream to 360p / 250 kbps so weak WiFi adapters never drop">🛡 STABLE</button>
       </div>
-      <span class="hint">S snapshot · R record · M mute · F fullscreen · P pip · N motion · AUTO quality</span>
+      <span class="hint">S snapshot · R record · M mute · F fullscreen · P pip · N motion · V night · H thermal · T talk · G stable · AUTO quality</span>
     </footer>
   </div>
 
@@ -109,6 +121,33 @@
   </div>
 
   <div class="toast-wrap"></div>
+
+  <!-- Night-vision gain filter: luminance → gamma lift (recovers detail a
+       flat brightness bump never could) → phosphor-green mapping. Same def
+       as the phone page, so preview and feed boost identically. Thermal no
+       longer uses an SVG filter — it's a live canvas renderer (viewer.js). -->
+  <svg aria-hidden="true" class="thermal-svg" focusable="false">
+    <defs>
+      <filter id="nvg" x="0%" y="0%" width="100%" height="100%">
+        <feColorMatrix type="matrix" values="0.299 0.587 0.114 0 0  0.299 0.587 0.114 0 0  0.299 0.587 0.114 0 0  0 0 0 1 0"/>
+        <feComponentTransfer>
+          <feFuncR type="gamma" exponent="0.65" amplitude="1.5" offset="0.02"/>
+          <feFuncG type="gamma" exponent="0.65" amplitude="1.5" offset="0.02"/>
+          <feFuncB type="gamma" exponent="0.65" amplitude="1.5" offset="0.02"/>
+        </feComponentTransfer>
+        <feComponentTransfer>
+          <feFuncR type="linear" slope="1.3" intercept="-0.08"/>
+          <feFuncG type="linear" slope="1.3" intercept="-0.08"/>
+          <feFuncB type="linear" slope="1.3" intercept="-0.08"/>
+        </feComponentTransfer>
+        <feComponentTransfer>
+          <feFuncR type="table" tableValues="0.03 0.08 0.18 0.45 0.95"/>
+          <feFuncG type="table" tableValues="0.6 0.72 0.86 0.98 1"/>
+          <feFuncB type="table" tableValues="0.12 0.24 0.4 0.7 1"/>
+        </feComponentTransfer>
+      </filter>
+    </defs>
+  </svg>
 
   <script src="/js/common.js"></script>
   <script src="/vendor/peerjs.min.js"></script>

@@ -22,6 +22,10 @@ const bwChip = $('#bwChip');
 const segQuality = $('#segQuality');
 const linkLost = $('#linkLost');
 const linkLostT = $('#linkLostT');
+const nvChip = $('#nvChip');
+const btnNight = $('#btnNight');
+const btnThermal = $('#btnThermal');
+const btnTalk = $('#btnTalk');
 const btn = {
   unmute: $('#btnUnmute'),
   copy: $('#btnCopy'),
@@ -98,7 +102,15 @@ function openDataChannel(phoneId) {
   try {
     const dc = peer.connect(phoneId, { reliable: true, serialization: 'json' });
     AQ.dc = dc;
-    dc.on('open', () => { AQ.dcOpen = true; dbg('VIEWER', 'quality channel open'); });
+    dc.on('open', () => {
+      AQ.dcOpen = true;
+      dbg('VIEWER', 'quality channel open');
+      // Deliver the current tier the moment the channel is up — a fresh
+      // link must start CAPPED, never encode uncapped while the engine
+      // gathers its first stats (a multi-Mbps startup burst is exactly
+      // what trips weak WiFi adapters into dropping).
+      sendQuality(AQ.tier);
+    });
     dc.on('data', (d) => {
       let m = d;
       if (typeof d === 'string') { try { m = JSON.parse(d); } catch { return; } }
@@ -212,7 +224,13 @@ function setQualityMode(mode) {
     const tier = QUALITY_MODES[mode];
     dbg('VIEWER', 'quality mode →', mode.toUpperCase(), `tier ${tier}`);
     sendQuality(tier);
-    toast(`Quality → ${QUALITY_TIERS[tier].label}`, 'info', 1500);
+    toast(
+      mode === 'stable'
+        ? '🛡 STABLE — minimal bandwidth, safest for weak WiFi'
+        : `Quality → ${QUALITY_TIERS[tier].label}`,
+      mode === 'stable' ? 'warn' : 'info',
+      1800
+    );
   }
 }
 
@@ -275,7 +293,7 @@ function aqTick(v, rttMs) {
     dbg('VIEWER', 'link congested', `loss ${lossPct.toFixed(1)}% jitter ${jitterMs.toFixed(0)}ms bw ${(bitrate / 1000) | 0}kbps → tier ${AQ.tier - 1}`);
     sendQuality(AQ.tier - 1);
     toast('Poor link — quality reduced', 'warn', 1500);
-  } else if (healthy && AQ.healthy >= AQ_HEALTH_STREAK && since >= AQ_COOLDOWN && AQ.tier < QUALITY_TIERS.length - 1) {
+  } else if (healthy && AQ.healthy >= AQ_HEALTH_STREAK && since >= AQ_COOLDOWN && AQ.tier < AUTO_CEIL_TIER) {
     AQ.lastStep = now;
     AQ.congested = 0;
     AQ.healthy = 0;
@@ -323,6 +341,389 @@ function buildRemoteLink() {
    the registry on every GO LIVE, so nothing is lost when the id changes. */
 function linkIdStore() {
   return `view-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/* ---------------------------------------------------------------- */
+/*  Night vision, thermal vision + the talk channel                  */
+/* ---------------------------------------------------------------- */
+
+/* Night vision — sample the received feed's luminance every 2s and
+   apply the phosphor-green filter when it's dark (AUTO). The canvas
+   read is pre-filter, so a brightened NVG image can never feed back
+   into the sensor and flicker the filter on/off. */
+const NV = {
+  mode: 'auto',       // 'auto' | 'on' | 'off'
+  active: false,
+  light: 100,         // last measured mean luminance (0–255)
+  timer: null,
+  forceLight: null,   // test hook — override the measured light
+};
+let thermal = false;
+
+const nvCanvas = document.createElement('canvas');
+nvCanvas.width = 8;
+nvCanvas.height = 6;
+const nvCtx = nvCanvas.getContext('2d', { willReadFrequently: true });
+
+function measureLight() {
+  if (NV.forceLight !== null) return NV.forceLight;
+  if (!live || feed.readyState < 2 || !feed.videoWidth) return NV.light;
+  try {
+    nvCtx.drawImage(feed, 0, 0, 8, 6);
+    const d = nvCtx.getImageData(0, 0, 8, 6).data;
+    let sum = 0;
+    for (let i = 0; i < d.length; i += 4) sum += d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114;
+    return sum / 48;
+  } catch { return NV.light; }
+}
+
+function nvTick() {
+  NV.light = measureLight();
+  if (NV.mode === 'auto') {
+    // hysteresis — engage below NVG_ON_LVL, disengage above NVG_OFF_LVL
+    if (NV.active && NV.light > NVG_OFF_LVL) NV.active = false;
+    else if (!NV.active && NV.light < NVG_ON_LVL) NV.active = true;
+  }
+  applyViewFilter();
+  if (nvChip) {
+    nvChip.textContent = `☾ ${NV.mode.toUpperCase()}`;
+    nvChip.classList.toggle('on', NV.active);
+  }
+  if (btnNight) btnNight.textContent = `☾ NIGHT ${NV.mode.toUpperCase()}`;
+}
+
+function setNightMode(m) {
+  if (!['auto', 'on', 'off'].includes(m)) return;
+  NV.mode = m;
+  if (m === 'on') NV.active = true;
+  else if (m === 'off') NV.active = false;
+  nvTick();
+  dbg('VIEWER', 'night vision →', m.toUpperCase());
+}
+
+function cycleNight() {
+  setNightMode(NV.mode === 'auto' ? 'on' : NV.mode === 'on' ? 'off' : 'auto');
+}
+
+/* ---------------------------------------------------------------- */
+/*  Thermal vision — live auto-ranged relative-heat renderer         */
+/* ---------------------------------------------------------------- */
+
+/* A phone camera is a visible-light sensor — it cannot measure temperature.
+   This renderer does the closest thing software can: ~8×/s it samples the
+   feed's luminance, AUTO-RANGES it (live percentile-clipped min→max, so the
+   palette always uses its full scale — like a real thermal cam's auto-
+   contrast, and dark scenes don't just wash to blue), maps it onto an
+   ironbow palette, temporally smooths it (hot spots glow steadily instead of
+   flickering) and marks the hottest/coolest spots. The REL HEAT scale shows
+   the live range. This is relative visible-light brightness — NOT real
+   temperature (a phone can't sense heat; see README). */
+
+const TH_SAMPLE_W = 96;   // sample grid width (96×54 for 16:9) — tiny CPU cost
+const TH_TICK_MS = 120;   // ~8 render passes/sec
+const TH_SMOOTH = 0.7;    // temporal smoothing (0 = none, 1 = frozen)
+const TH_P_LO = 0.02;     // percentile clip — sensor noise can't blow the scale
+const TH_P_HI = 0.98;
+const TH_MIN_SPAN = 24;   // never stretch a range smaller than this: a flat
+                          // scene maps onto a centred band instead of
+                          // stretching sensor noise into a blank/speckled mess
+const TH_MARK_MIN_RANGE = 10; // below this the scene is uniform — no markers
+
+const TH_LUT = (() => {
+  const stops = [
+    [0.0, [0.0, 0.0, 0.35]],
+    [0.22, [0.3, 0.0, 0.65]],
+    [0.45, [0.9, 0.1, 0.2]],
+    [0.68, [1.0, 0.5, 0.0]],
+    [0.88, [1.0, 0.95, 0.3]],
+    [1.0, [1.0, 1.0, 1.0]],
+  ];
+  const lut = new Uint8ClampedArray(256 * 3);
+  for (let i = 0; i < 256; i++) {
+    const t = i / 255;
+    let s = 0;
+    while (s < stops.length - 2 && t > stops[s + 1][0]) s += 1;
+    const [t0, c0] = stops[s];
+    const [t1, c1] = stops[s + 1];
+    const f = Math.min(1, Math.max(0, (t - t0) / (t1 - t0)));
+    lut[i * 3] = Math.round(c0[0] + (c1[0] - c0[0]) * f);
+    lut[i * 3 + 1] = Math.round(c0[1] + (c1[1] - c0[1]) * f);
+    lut[i * 3 + 2] = Math.round(c0[2] + (c1[2] - c0[2]) * f);
+  }
+  return lut;
+})();
+
+const thCanvas = $('#thermalCanvas');
+const thCtx = thCanvas ? thCanvas.getContext('2d') : null;
+const thMin = $('#thMin');
+const thMax = $('#thMax');
+const thScale = $('#thScale');
+const thNote = $('#thNote');
+const thSample = document.createElement('canvas');
+const thSampleCtx = thSample.getContext('2d', { willReadFrequently: true });
+const thFrame = document.createElement('canvas');
+const thFrameCtx = thFrame.getContext('2d');
+let thPrev = null;   // rolling-averaged luminance map {data, w, h}
+let thOutImg = null; // reused ImageData output buffer (no per-frame allocs)
+let thSort = null;   // reused sort buffer
+let thTimer = null;
+let thHotCell = -1;  // HOT/COLD marker persistence — a marker only moves when
+let thColdCell = -1; // a new cell clearly beats it, so it never jitters on noise
+let thDiag = { realRange: 0, markers: false, lo: 0, hi: 0 }; // last-pass diagnostics
+
+/* Centred minimum-span range: keep the scene's true range when there IS
+   contrast; otherwise floor it to TH_MIN_SPAN around the midpoint so a flat
+   scene still shows a usable gradient instead of stretched noise. */
+function thRange(lo, hi) {
+  const realRange = Math.max(0, hi - lo);
+  const mid = (lo + hi) / 2;
+  const span = Math.max(TH_MIN_SPAN, realRange);
+  return { lo: mid - span / 2, hi: mid + span / 2, realRange, span };
+}
+
+function thRender() {
+  if (!thermal || !thCtx) return;
+  if (!live || feed.readyState < 2 || !feed.videoWidth) {
+    thCtx.clearRect(0, 0, thCanvas.width, thCanvas.height);
+    if (thMin) thMin.textContent = '--';
+    if (thMax) thMax.textContent = '--';
+    if (thNote) thNote.textContent = '';
+    return;
+  }
+  const r = videoContentRect();
+  if (!r || r.width < 4 || r.height < 4) return;
+  thCanvas.style.left = `${r.left}px`;
+  thCanvas.style.top = `${r.top}px`;
+  thCanvas.width = Math.round(r.width);
+  thCanvas.height = Math.round(r.height);
+
+  const w = TH_SAMPLE_W;
+  const h = Math.max(24, Math.round((w * r.height) / r.width));
+  thSample.width = w;
+  thSample.height = h;
+  thSampleCtx.drawImage(feed, 0, 0, w, h);
+  const d = thSampleCtx.getImageData(0, 0, w, h).data;
+
+  // temporal smoothing — new maps blend with history. NaN marks the first
+  // frame (Float32Array is zero-filled, so fill explicitly) → take full L.
+  const n = w * h;
+  if (!thPrev || thPrev.w !== w || thPrev.h !== h) {
+    thPrev = { data: new Float32Array(n), w, h };
+    thPrev.data.fill(NaN);
+    thOutImg = thFrameCtx.createImageData(w, h); // reused — no per-frame alloc
+    thSort = new Float32Array(n);
+    thHotCell = -1; // grid changed — markers re-acquire
+    thColdCell = -1;
+  }
+  const lum = thPrev.data;
+  for (let i = 0, j = 0; i < n; i++, j += 4) {
+    const L = 0.299 * d[j] + 0.587 * d[j + 1] + 0.114 * d[j + 2];
+    lum[i] = Number.isNaN(lum[i]) ? L : lum[i] * TH_SMOOTH + L * (1 - TH_SMOOTH);
+  }
+
+  // live auto-range with percentile clipping (reused sort buffer). The
+  // centred minimum span keeps flat scenes from stretching noise — the
+  // "blank screen + flying markers" failure on uniform walls/dim rooms.
+  thSort.set(lum);
+  thSort.sort();
+  const pLo = thSort[Math.min(n - 1, Math.floor(n * TH_P_LO))];
+  const pHi = thSort[Math.max(0, Math.ceil(n * TH_P_HI) - 1)];
+  const rng = thRange(pLo, pHi);
+  const lo = rng.lo;
+  const hi = rng.hi;
+  const span = rng.span;
+  thDiag = {
+    realRange: Math.round(rng.realRange),
+    markers: rng.realRange >= TH_MARK_MIN_RANGE,
+    lo: Math.round(lo),
+    hi: Math.round(hi),
+  };
+
+  const data = thOutImg.data;
+  let hot = 0;
+  let cold = 0;
+  for (let i = 0; i < n; i++) {
+    const t = Math.max(0, Math.min(1, (lum[i] - lo) / span));
+    const k = (t * 255) | 0;
+    data[i * 4] = TH_LUT[k * 3];
+    data[i * 4 + 1] = TH_LUT[k * 3 + 1];
+    data[i * 4 + 2] = TH_LUT[k * 3 + 2];
+    data[i * 4 + 3] = 255;
+    if (lum[i] > lum[hot]) hot = i;
+    if (lum[i] < lum[cold]) cold = i;
+  }
+
+  thFrame.width = w;
+  thFrame.height = h;
+  thFrameCtx.putImageData(thOutImg, 0, 0);
+  thCtx.imageSmoothingEnabled = true;
+  thCtx.clearRect(0, 0, thCanvas.width, thCanvas.height);
+  thCtx.drawImage(thFrame, 0, 0, thCanvas.width, thCanvas.height);
+
+  // hottest / coolest spot markers (like a real thermal cam's reticles).
+  // Only on scenes with real contrast, and with leader persistence so the
+  // markers track a moving subject instead of jittering on sensor noise.
+  const mark = (idx, label, color) => {
+    const mx = ((idx % w) + 0.5) / w * thCanvas.width;
+    const my = (((idx / w) | 0) + 0.5) / h * thCanvas.height;
+    thCtx.strokeStyle = color;
+    thCtx.lineWidth = 1.5;
+    thCtx.beginPath();
+    thCtx.arc(mx, my, 8, 0, Math.PI * 2);
+    thCtx.moveTo(mx - 12, my); thCtx.lineTo(mx + 12, my);
+    thCtx.moveTo(mx, my - 12); thCtx.lineTo(mx, my + 12);
+    thCtx.stroke();
+    thCtx.fillStyle = color;
+    thCtx.font = '10px monospace';
+    thCtx.fillText(label, mx + 14, my - 8);
+  };
+  if (thDiag.markers) {
+    // release/fade thresholds from the TRUE scene range (not the floored
+    // mapping band): a hot leader must stay in the top 40% to keep its
+    // reticle, and only loses it to a cell that is clearly hotter
+    const hotFloor = pLo + (pHi - pLo) * 0.6;
+    const coldCeil = pLo + (pHi - pLo) * 0.4;
+    if (thHotCell < 0 || lum[thHotCell] < hotFloor) thHotCell = -1;
+    if (thHotCell < 0 || lum[hot] > lum[thHotCell] * 1.1) thHotCell = hot;
+    if (thColdCell < 0 || lum[thColdCell] > coldCeil) thColdCell = -1;
+    if (thColdCell < 0 || lum[cold] < lum[thColdCell] * 0.9) thColdCell = cold;
+    mark(thHotCell, 'HOT', '#ffffff');
+    mark(thColdCell, 'COLD', '#7db4ff');
+  }
+  if (thNote) thNote.textContent = thDiag.markers ? '' : 'FLAT SCENE — NEEDS CONTRAST';
+
+  // display the TRUE percentile range (not the floored mapping band, which
+  // can go negative on flat scenes and reads as broken)
+  if (thMin) thMin.textContent = String(Math.round(pLo));
+  if (thMax) thMax.textContent = String(Math.round(pHi));
+}
+
+function toggleThermal() {
+  thermal = !thermal;
+  if (btnThermal) {
+    btnThermal.classList.toggle('on', thermal);
+    btnThermal.textContent = thermal ? '♨ THERMAL LIVE' : '♨ THERMAL';
+  }
+  if (thermal) {
+    thPrev = null;
+    thHotCell = -1;
+    thColdCell = -1;
+    if (thCanvas) thCanvas.classList.add('on');
+    if (thScale) thScale.classList.remove('hidden');
+    thRender();
+    thTimer = setInterval(thRender, TH_TICK_MS);
+    dbg('VIEWER', 'thermal LIVE — auto-ranged heat render');
+    toast('Thermal LIVE — relative heat view (not real °C)', 'info', 1800);
+  } else {
+    stopThermal();
+  }
+  applyViewFilter();
+}
+
+function stopThermal() {
+  clearInterval(thTimer);
+  thTimer = null;
+  if (thCanvas) { thCanvas.classList.remove('on'); thCtx.clearRect(0, 0, thCanvas.width, thCanvas.height); }
+  if (thScale) thScale.classList.add('hidden');
+}
+
+/* The feed's own filter is now night vision only — thermal paints its own
+   opaque canvas over the feed, so NVG stands aside while it runs. */
+function applyViewFilter() {
+  feed.classList.remove('nvg');
+  if (!thermal && (NV.mode === 'on' || (NV.mode === 'auto' && NV.active))) feed.classList.add('nvg');
+}
+
+/* Two-way audio — the viewer's mic is sent over a SECOND PeerJS call
+   (PeerJS 1.5.x can't add tracks to a live call), which the phone
+   answers and plays on its speaker. TALK is sticky: once armed it
+   survives re-links, so a reconnected camera still hears you. */
+let micStream = null;  // viewer's talk mic
+let talkOn = false;    // user intent — survives teardown/re-link
+let talkCall = null;   // viewer→phone audio call
+let talkPending = false; // guard against rapid double-clicks
+
+async function toggleTalk() {
+  if (talkPending) return;
+  talkPending = true;
+  try {
+    if (!live || !call) return toast('Start the stream before talking', 'warn');
+    if (talkOn) {
+      stopTalk();
+      toast('Talk off', 'info', 1200);
+      return;
+    }
+    try {
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+    } catch {
+      micStream = null;
+      return toast('Mic access denied — cannot talk to the phone', 'error');
+    }
+    const track = micStream.getAudioTracks()[0];
+    if (!track) {
+      micStream.getTracks().forEach((t) => t.stop());
+      micStream = null;
+      return toast('No microphone found on this PC', 'error');
+    }
+    talkOn = true;
+    setTalkBtn(true);
+    dbg('VIEWER', 'talk ON — mic streaming to phone');
+    openTalkChannel(call.peer);
+  } finally {
+    talkPending = false;
+  }
+}
+
+/* Open (or re-open after a re-link) the talk channel to the current phone. */
+function openTalkChannel(phoneId) {
+  if (!talkOn || !peer || !live) return;
+  closeTalkChannel();
+  if (!micStream) return;
+  const track = micStream.getAudioTracks()[0];
+  if (!track || track.readyState === 'ended') {
+    // the previous mic was stopped at teardown — re-acquire for this link
+    navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } })
+      .then((s) => {
+        // talk may have been toggled off / link torn down while we waited —
+        // never orphan a freshly-acquired mic stream
+        if (!talkOn || !live) { s.getTracks().forEach((t) => t.stop()); return; }
+        micStream = s;
+        openTalkChannel(phoneId);
+      })
+      .catch(() => dbg('VIEWER', 'talk mic re-acquire failed'));
+    return;
+  }
+  try {
+    const tc = peer.call(phoneId, micStream, { metadata: { pin: PIN, talk: true } });
+    talkCall = tc;
+    tc.on('close', () => { if (talkCall === tc) talkCall = null; });
+    tc.on('error', (e) => { dbg('VIEWER', 'talk channel error', e && e.type); if (talkCall === tc) talkCall = null; });
+    dbg('VIEWER', 'talk channel opened →', phoneId);
+  } catch (e) {
+    dbg('VIEWER', 'talk channel failed', e && e.message);
+  }
+}
+
+function closeTalkChannel() {
+  if (talkCall) { try { talkCall.close(); } catch { /* ignore */ } }
+  talkCall = null;
+}
+
+function stopTalk() {
+  talkOn = false;
+  closeTalkChannel();
+  if (micStream) { micStream.getTracks().forEach((t) => t.stop()); micStream = null; }
+  setTalkBtn(false);
+  dbg('VIEWER', 'talk OFF');
+}
+
+function setTalkBtn(on) {
+  if (btnTalk) {
+    btnTalk.classList.toggle('on', on);
+    btnTalk.textContent = on ? '◉ TALK ON' : '◉ TALK';
+  }
 }
 
 /* ---------------------------------------------------------------- */
@@ -392,6 +793,11 @@ async function init() {
   btn.pip.addEventListener('click', togglePip);
   btn.fs.addEventListener('click', toggleFullscreen);
   btn.mute.addEventListener('click', toggleMute);
+  if (btnNight) btnNight.addEventListener('click', cycleNight);
+  if (btnThermal) btnThermal.addEventListener('click', toggleThermal);
+  if (btnTalk) btnTalk.addEventListener('click', toggleTalk);
+  NV.timer = setInterval(nvTick, 2000);
+  nvTick();
   wireMotion();
 
   if (segQuality) {
@@ -418,6 +824,10 @@ async function init() {
     else if (k === 'f') toggleFullscreen();
     else if (k === 'p') togglePip();
     else if (k === 'n') setMotionEnabled(!MD.enabled);
+    else if (k === 'v') cycleNight();
+    else if (k === 'h') toggleThermal();
+    else if (k === 't') toggleTalk();
+    else if (k === 'g') setQualityMode(AQ.mode === 'stable' ? 'auto' : 'stable');
   });
 }
 
@@ -445,6 +855,7 @@ function onIncomingCall(c) {
   AQ.dcOpen = false;
   openDataChannel(c.peer);
   if (AQ.mode !== 'auto') sendQuality(QUALITY_MODES[AQ.mode]); // re-assert manual choice
+  if (talkOn) openTalkChannel(c.peer); // a fresh link still hears you
   c.on('stream', attachStream);
   c.on('close', () => {
     dbg('VIEWER', 'call close');
@@ -557,11 +968,23 @@ function teardown() {
   AQ.healthy = 0;
   AQ.tier = QUALITY_START_TIER;
   AQ.slow = false;
-  if (qualityChip) qualityChip.textContent = 'Q AUTO · --';
+  if (qualityChip) qualityChip.textContent = `Q ${AQ.mode === 'auto' ? 'AUTO' : AQ.mode.toUpperCase()} · --`;
   if (bwChip) bwChip.textContent = 'BW --';
   stopStats();
   stopRecord(true);
   feed.srcObject = null;
+  // close the talk channel and release the mic; talkOn stays armed so a
+  // re-linking camera still hears you (the mic is re-requested per link)
+  closeTalkChannel();
+  if (micStream) { micStream.getTracks().forEach((t) => t.stop()); micStream = null; }
+  stopThermal(); // halt the live heat renderer + hide its canvas
+  feed.classList.remove('nvg');
+  thermal = false;
+  NV.active = false;
+  NV.light = 100;
+  if (nvChip) { nvChip.textContent = `☾ ${NV.mode.toUpperCase()}`; nvChip.classList.remove('on'); }
+  if (btnNight) btnNight.textContent = `☾ NIGHT ${NV.mode.toUpperCase()}`;
+  if (btnThermal) { btnThermal.classList.remove('on'); btnThermal.textContent = '♨ THERMAL'; }
   stageHud.classList.remove('on');
   recBadge.classList.remove('on');
   motionReset();
@@ -863,6 +1286,7 @@ window.__secamCall = {
 /* test hook — used by test/e2e.js to drive the adaptive-quality engine */
 window.__secamQuality = {
   get mode() { return AQ.mode; },
+  get stable() { return AQ.mode === 'stable'; },
   get tier() { return AQ.tier; },
   get slow() { return AQ.slow; },
   get dcOpen() { return AQ.dcOpen; },
@@ -873,6 +1297,37 @@ window.__secamQuality = {
   forceCongest: (b) => { AQ.forceCongest = !!b; },
   forceHealth: (b) => { AQ.forceHealth = !!b; },
   sendQuality: (n) => sendQuality(n),
+};
+
+/* test hook — night vision + thermal introspection (e2e) */
+window.__secamVision = {
+  get mode() { return NV.mode; },
+  get active() { return NV.active; },
+  get thermal() { return thermal; },
+  get thRunning() { return !!thTimer; },
+  get thDiag() { return thDiag; },
+  thRange,
+  get light() { return Math.round(NV.light); },
+  get feedClass() { return feed.className; },
+  cycleNight,
+  setNight: setNightMode,
+  toggleThermal,
+  forceLight: (l) => {
+    NV.forceLight = l === null ? null : Math.max(0, Math.min(255, Number(l) || 0));
+    if (l !== null) nvTick();
+  },
+};
+
+/* test hook — talk channel introspection (e2e) */
+window.__secamTalk = {
+  get on() { return talkOn; },
+  get callActive() { return !!(talkCall && talkCall.peerConnection); },
+  get audioTracks() {
+    return talkCall && talkCall.peerConnection
+      ? talkCall.peerConnection.getSenders().filter((s) => s.track && s.track.kind === 'audio').map((s) => s.track.readyState)
+      : [];
+  },
+  toggle: toggleTalk,
 };
 
 /* test hook — used by test/e2e.js */
@@ -890,11 +1345,20 @@ window.__secamMotion = {
 /* ---------------------------------------------------------------- */
 
 function snapshot() {
-  if (feed.readyState < 2) return toast('No frame available yet', 'warn');
+  if (feed.readyState < 2 && !(thermal && thCanvas && thCanvas.width > 4)) return toast('No frame available yet', 'warn');
   const c = document.createElement('canvas');
   c.width = feed.videoWidth;
   c.height = feed.videoHeight;
-  c.getContext('2d').drawImage(feed, 0, 0);
+  const ctx = c.getContext('2d');
+  if (thermal && thCanvas && thCanvas.width > 4) {
+    // capture the live heat map, not the raw feed
+    ctx.drawImage(thCanvas, 0, 0, c.width, c.height);
+  } else {
+    // preserve the active night-vision mode in the capture
+    const flt = getComputedStyle(feed).filter;
+    if (flt && flt !== 'none') ctx.filter = flt;
+    ctx.drawImage(feed, 0, 0);
+  }
   c.toBlob((b) => {
     if (b) {
       downloadBlob(b, `sec-cam-snap-${stamp()}.png`);
@@ -954,12 +1418,16 @@ function stopRecord(silent, quiet) {
 }
 
 function togglePip() {
-  if (!live || feed.readyState < 2) return toast('No live feed yet', 'warn');
+  const ready = feed.readyState >= 2 || (thermal && thCanvas && thCanvas.width > 4);
+  if (!live || !ready) return toast('No live feed yet', 'warn');
   if (!document.pictureInPictureEnabled) return toast('Picture-in-picture not supported', 'error');
   if (document.pictureInPictureElement) {
     document.exitPictureInPicture().catch(() => { /* ignore */ });
   } else {
-    feed.requestPictureInPicture().catch(() => toast('PiP failed', 'error'));
+    // thermal paints an overlay canvas, not the feed element — PiP the heat
+    // map itself so the PiP window matches the stage
+    const src = thermal && thCanvas && thCanvas.width > 4 ? thCanvas : feed;
+    src.requestPictureInPicture().catch(() => toast('PiP failed', 'error'));
   }
 }
 

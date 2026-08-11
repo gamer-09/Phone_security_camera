@@ -17,6 +17,10 @@ const btnMic = $('#btnMic');
 const btnLive = $('#btnLive');
 const qChip = $('#qChip');
 const offlineBadge = $('#offlineBadge');
+const nvChip = $('#nvChip');
+const talkChip = $('#talkChip');
+const segNight = $('#segNight');
+const talkUnlock = $('#talkUnlock');
 
 const RES_OPTS = [
   { label: 'SD 480p', w: 854, h: 480 },
@@ -102,7 +106,9 @@ function buildFakeStream() {
   let t = 0;
   const draw = () => {
     t += 1;
-    ctx.fillStyle = '#071018';
+    // near-black scene — the sim is a "night" feed, so the viewer's
+    // night-vision AUTO mode has a real dark scene to react to
+    ctx.fillStyle = '#020408';
     ctx.fillRect(0, 0, 640, 360);
     ctx.strokeStyle = 'rgba(0,229,255,.55)';
     ctx.lineWidth = 2;
@@ -191,6 +197,7 @@ async function acquire() {
     throw err;
   }
   video.srcObject = stream;
+  torchUnsupported = false; // a fresh camera gets a fresh chance at the torch
   return stream;
 }
 
@@ -266,6 +273,7 @@ async function swapStream(opts = {}) {
 
   stream = newStream;
   video.srcObject = newStream;
+  torchUnsupported = false; // the other camera may have a flash this one lacked
   if (!cameraChange && old) old.getTracks().forEach((t) => t.stop());
 }
 
@@ -292,16 +300,49 @@ async function flip() {
   }
 }
 
-async function toggleTorch() {
+/* Set the torch to on/off. silent=true suppresses the 'not supported' toast
+   (used by the auto-torch follower — it should never nag while tracking the
+   light level). Returns whether the camera accepted the constraint. */
+async function setTorch(on, silent = false) {
   const track = stream && stream.getVideoTracks()[0];
-  if (!track) return;
-  torchOn = !torchOn;
+  if (!track) return false;
   try {
-    await track.applyConstraints({ advanced: [{ torch: torchOn }] });
+    await track.applyConstraints({ advanced: [{ torch: on }] });
+    torchOn = on;
+    torchUnsupported = false;
     setTorchBtn();
+    return true;
   } catch {
-    torchOn = !torchOn;
-    toast('Torch not supported on this camera', 'warn');
+    torchUnsupported = true; // any failure (on OR off) means no reliable torch
+    if (!silent) toast('Torch not supported on this camera', 'warn');
+    setTorchBtn();
+    return false;
+  }
+}
+
+async function toggleTorch() {
+  if (!stream) return;
+  torchAuto = false;
+  torchManual = true; // manual control overrides the auto behaviour
+  await setTorch(!torchOn, false);
+}
+
+/* Follow the night-vision state with the flashlight. Runs after every NV
+   tick: dark (or forced ON) → torch on; light returns → torch back off.
+   Never fights a torch the user set by hand. */
+async function syncAutoTorch() {
+  if (!NV.torch) { NV.torchIntent = null; return; }
+  const wantOn = NV.mode === 'on' || (NV.mode === 'auto' && NV.active);
+  NV.torchIntent = wantOn ? 'on' : 'off';
+  if (FAKE_MODE) return; // the sim camera has no real flash
+  if (wantOn) {
+    // torchManual: the user set the torch by hand — never fight their choice
+    if (torchOn || torchAuto || torchUnsupported || torchManual) return;
+    torchAuto = true;
+    if (!(await setTorch(true, true))) { torchAuto = false; torchUnsupported = true; }
+  } else {
+    if (torchAuto) { torchAuto = false; await setTorch(false, true); }
+    torchManual = false; // light returned — the next dark cycle may auto-arm again
   }
 }
 
@@ -482,6 +523,7 @@ async function goLive(opts = {}) {
   peer = new Peer(myId, peerOpts());
 
   peer.on('connection', onDataConn); // quality-command channel from the viewer
+  peer.on('call', handleIncomingCall); // the viewer's talk (mic) channel
 
   peer.on('open', (id) => {
     dbg('PHONE', 'open — calling', targetId);
@@ -619,6 +661,9 @@ function cleanup() {
   AQ.dc = null; // peer.destroy() closes the quality channel with the peer
   clearInterval(AQ.reportTimer);
   AQ.reportTimer = null;
+  if (talkCall) { try { talkCall.close(); } catch { /* ignore */ } }
+  talkCall = null;
+  stopTalkPlayback();
   setLive(false);
   releaseWake();
 }
@@ -643,6 +688,34 @@ window.__secam = {
   forceWaiting() { if (!live) { scheduleWait('test'); return statusPill.textContent; } return null; },
   cancelReconnect() { clearTimeout(reconnectTimer); reconnectTimer = null; setStatus('STANDBY'); },
   setReconnectDelay(ms) { testReconnectDelay = ms === null ? null : Math.max(0, Number(ms) || 0); },
+  // night vision + talkback introspection (e2e)
+  get nv() { return { mode: NV.mode, active: video.classList.contains('nvg'), light: Math.round(NV.light), torchIntent: NV.torchIntent }; },
+  setNight(m) { setNightMode(m); },
+  forceLight(l) { NV.forceLight = l === null ? null : Math.max(0, Math.min(255, Number(l) || 0)); if (l !== null) nvTick(); },
+  get torch() { return torchOn; },
+  get torchAuto() { return torchAuto; },
+  setAutoTorch(b) {
+    NV.torch = !!b;
+    try { localStorage.setItem('secam_auto_torch', NV.torch ? '1' : '0'); } catch { /* ignore */ }
+    NV.torchIntent = null;
+    if (!NV.torch && torchAuto) { torchAuto = false; setTorch(false, true); }
+    const btnAutoTorch = $('#btnAutoTorch');
+    if (btnAutoTorch) btnAutoTorch.classList.toggle('on', NV.torch);
+    syncAutoTorch();
+  },
+  // e2e: simulate the torch being lit (the sim camera has no real LED) so
+  // the torch-hold hysteresis can be exercised
+  debugSimTorch(b) {
+    torchAuto = !!b;
+    torchOn = !!b;
+    torchManual = false;
+    setTorchBtn();
+    if (!b) NV.brightStreak = 0;
+  },
+  get talkActive() {
+    return !!(talkStream && talkAudio && talkAudio.srcObject &&
+      talkAudio.srcObject.getAudioTracks().some((t) => t.readyState === 'live'));
+  },
 };
 
 function setLive(on) {
@@ -719,12 +792,264 @@ document.addEventListener('visibilitychange', () => {
 });
 
 /* ---------------------------------------------------------------- */
+/*  Night vision — watch the camera's own luminance and engage the   */
+/*  phosphor-green filter on the local preview when it gets dark.    */
+/*  The canvas read is pre-filter, so the brightened NVG image can   */
+/*  never feed back into the sensor and flicker.                     */
+/* ---------------------------------------------------------------- */
+
+const NV = {
+  mode: 'auto',       // 'auto' | 'on' | 'off'
+  active: false,
+  light: 100,         // last measured mean luminance (0–255)
+  timer: null,
+  forceLight: null,   // test hook — override the measured light
+  // AUTO TORCH: fire the flashlight whenever night vision is on, so the
+  // camera has REAL light to capture (software gain can only amplify what
+  // the sensor records — in total darkness that's nothing). Default on;
+  // remembered across sessions.
+  torch: (() => { try { return localStorage.getItem('secam_auto_torch') !== '0'; } catch { return true; } })(),
+  torchIntent: null,  // last auto-torch decision — 'on' | 'off' | null (e2e + diagnostics)
+  brightStreak: 0,    // consecutive samples that look "too bright"
+  probeCooldown: 0,   // until when the ambient probe is paused (after a dark result)
+};
+
+let torchAuto = false;        // is the torch currently on because NV turned it on?
+let torchUnsupported = false; // this camera has no flash — don't retry every tick
+let torchManual = false;      // the user set the torch by hand — auto never fights it
+
+/* Torch-hold hysteresis. Once the auto-torch is on, the light reading is
+   dominated by the torch's own glow — a naive "too bright → off" test
+   would disengage night vision the moment the torch fires, the room goes
+   dark, NVG re-engages, the torch fires again… an endless flicker loop.
+   Instead: a torch-lit reading must stay FAR above ambient-dark for
+   several samples, and even then we PROBE the true ambient light with the
+   torch briefly off before trusting it. The probe only triggers on
+   readings that really look like daylight, so the torch never blinks in a
+   normal dark room. */
+const NVG_HOLD_LVL = 95;          // torch-lit readings above this look "bright"
+const NVG_HOLD_STREAK = 3;        // …and must stay there this many samples (2s each)
+const NVG_PROBE_MS = 1400;        // torch-off time for the probe (exposure settle)
+const NVG_PROBE_COOLDOWN = 60000; // after a "still dark" probe, pause probing for 1 min
+
+const nvCanvas = document.createElement('canvas');
+nvCanvas.width = 8;
+nvCanvas.height = 6;
+const nvCtx = nvCanvas.getContext('2d', { willReadFrequently: true });
+
+async function measureLight() {
+  if (NV.forceLight !== null) return NV.forceLight;
+  // The sim is a dark "night" scene by design, so report a dark level
+  // directly. (Headless Chrome's canvas.captureStream glitches the LOCAL
+  // preview/track frames to teal under SwiftShader — the encoder path used
+  // by the viewer is correct — so reading the sim canvas is unreliable.)
+  if (FAKE_MODE) return 12;
+  // Try ImageCapture first — reads the raw frame from the camera track,
+  // bypassing any rendering glitches in the preview video element (e.g.
+  // Chrome's canvas.captureStream producing teal frames in headless).
+  const track = stream && stream.getVideoTracks()[0];
+  if (track && typeof ImageCapture !== 'undefined') {
+    try {
+      const cap = new ImageCapture(track);
+      const frame = await cap.grabFrame();
+      nvCtx.drawImage(frame, 0, 0, 8, 6);
+      frame.close();
+      const d = nvCtx.getImageData(0, 0, 8, 6).data;
+      let sum = 0;
+      for (let i = 0; i < d.length; i += 4) sum += d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114;
+      return sum / 48;
+    } catch { /* fall through to the preview */ }
+  }
+  // Fallback: sample the preview video element directly
+  if (!video || video.readyState < 2 || !video.videoWidth) return NV.light;
+  try {
+    nvCtx.drawImage(video, 0, 0, 8, 6);
+    const d = nvCtx.getImageData(0, 0, 8, 6).data;
+    let sum = 0;
+    for (let i = 0; i < d.length; i += 4) sum += d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114;
+    return sum / 48;
+  } catch { return NV.light; }
+}
+
+async function nvTick() {
+  NV.light = await measureLight();
+  if (NV.mode === 'auto') {
+    if (torchAuto) {
+      // Torch-lit: the reading is dominated by the torch's own glow — hold
+      // night vision on unless the brightness persists well above ambient
+      // dark for several samples, and even then probe the true ambient.
+      if (NV.active && NV.light > NVG_HOLD_LVL) {
+        if (NV.probeCooldown > Date.now()) {
+          NV.brightStreak = 0; // a recent probe said the room is genuinely dark — stop counting
+        } else {
+          NV.brightStreak += 1;
+          if (NV.brightStreak >= NVG_HOLD_STREAK) {
+            NV.brightStreak = 0;
+            const ambient = await probeAmbient();
+            if (ambient > NVG_OFF_LVL) NV.active = false;                  // real daylight
+            else NV.probeCooldown = Date.now() + NVG_PROBE_COOLDOWN;        // torch was faking it
+          }
+        }
+      } else {
+        NV.brightStreak = 0;
+        if (!NV.active && NV.light < NVG_ON_LVL) NV.active = true;
+      }
+    } else if (NV.active && NV.light > NVG_OFF_LVL) {
+      NV.active = false; // no torch involved — plain instant hysteresis
+    } else if (!NV.active && NV.light < NVG_ON_LVL) {
+      NV.active = true;
+    }
+  }
+  applyNightVision();
+}
+
+/* Briefly kill the torch to read the room's TRUE ambient brightness (the
+   torch itself lights the frame, so its glow can't be trusted as daylight).
+   The brief blink only happens when the reading really looks bright — see
+   NVG_HOLD_LVL above. If the torch can't be turned off the reading is
+   meaningless — assume the room is still dark and keep night vision lit
+   (safe direction). In FAKE_MODE the sim torch always "fails" but the
+   forceLight hook drives the read instead. */
+async function probeAmbient() {
+  const hadTorch = torchOn;
+  const offOk = await setTorch(false, true);
+  await new Promise((r) => setTimeout(r, NVG_PROBE_MS));
+  const ambient = !offOk && !FAKE_MODE ? NVG_ON_LVL - 1 : await measureLight();
+  if (hadTorch) await setTorch(true, true);
+  dbg('PHONE', 'torch probe — ambient', Math.round(ambient), hadTorch ? '(torch was on)' : '(torch was off)');
+  return ambient;
+}
+
+function applyNightVision() {
+  const on = NV.mode === 'on' || (NV.mode === 'auto' && NV.active);
+  video.classList.toggle('nvg', on);
+  if (nvChip) {
+    nvChip.textContent = `☾ ${NV.mode.toUpperCase()}`;
+    nvChip.classList.toggle('on', on);
+  }
+  if (segNight) {
+    $$('#segNight button').forEach((b) => b.classList.toggle('on', b.dataset.nv === NV.mode));
+  }
+  syncAutoTorch(); // dark + night vision on → flashlight on (if available)
+}
+
+function setNightMode(m) {
+  if (!['auto', 'on', 'off'].includes(m)) return;
+  NV.mode = m;
+  NV.brightStreak = 0; // a mode switch never inherits a half-counted streak
+  if (m === 'on') NV.active = true;
+  else if (m === 'off') NV.active = false;
+  applyNightVision();
+  dbg('PHONE', 'night vision →', m.toUpperCase());
+}
+
+/* ---------------------------------------------------------------- */
+/*  Two-way audio — the viewer opens a second PeerJS call carrying   */
+/*  its microphone; we answer it and play it through this phone's    */
+/*  speaker (walkie-talkie style).                                   */
+/* ---------------------------------------------------------------- */
+
+let talkCall = null;   // the viewer→phone audio call
+let talkAudio = null;  // <audio> element for the viewer's voice
+let talkStream = null;
+
+function handleIncomingCall(c) {
+  const md = c.metadata || {};
+  const phonePin = pinInput.value.trim() || new URLSearchParams(location.search).get('pin') || '';
+  // defense-in-depth: never accept a talk call without a known PIN
+  if (!md.talk || !phonePin || String(md.pin) !== String(phonePin)) {
+    dbg('PHONE', 'rejected incoming call', md.talk ? 'wrong pin' : 'not a talk call');
+    try { c.close(); } catch { /* ignore */ }
+    return;
+  }
+  dbg('PHONE', 'viewer talk channel — answering');
+  if (talkCall) { try { talkCall.close(); } catch { /* ignore */ } }
+  talkCall = c;
+  c.answer();
+  c.on('stream', (s) => playTalk(s));
+  c.on('close', () => { if (talkCall === c) { talkCall = null; stopTalkPlayback(); } });
+  c.on('error', (e) => { dbg('PHONE', 'talk channel error', e && e.type); if (talkCall === c) talkCall = null; });
+}
+
+function playTalk(s) {
+  // detach the previous track's ended handler — a stale 'ended' from a
+  // replaced talk channel must not kill the current playback
+  if (talkStream) {
+    const oldTrack = talkStream.getAudioTracks()[0];
+    if (oldTrack) oldTrack.removeEventListener('ended', stopTalkPlayback);
+  }
+  talkStream = s;
+  dbg('PHONE', 'viewer is speaking — playing on speaker');
+  if (!talkAudio) {
+    talkAudio = new Audio();
+    talkAudio.autoplay = true;
+    talkAudio.setAttribute('playsinline', '');
+    document.body.appendChild(talkAudio);
+  }
+  talkAudio.srcObject = s;
+  setTalkUI(true);
+  const p = talkAudio.play();
+  if (p && p.catch) p.catch(() => { if (talkUnlock) talkUnlock.classList.remove('hidden'); });
+  const t = s.getAudioTracks()[0];
+  // named reference (not an anonymous wrapper) so the next playTalk() can
+  // removeEventListener it when the channel is replaced
+  if (t) t.addEventListener('ended', stopTalkPlayback);
+}
+
+function stopTalkPlayback() {
+  if (talkAudio) {
+    try { talkAudio.pause(); } catch { /* ignore */ }
+    talkAudio.srcObject = null;
+  }
+  setTalkUI(false);
+}
+
+function setTalkUI(on) {
+  if (talkChip) {
+    talkChip.textContent = on ? 'TALK ●' : 'TALK --';
+    talkChip.classList.toggle('on', on);
+  }
+  if (!on && talkUnlock) talkUnlock.classList.add('hidden');
+  if (on) toast('🔊 Viewer is speaking through this phone', 'info', 2000);
+}
+
+/* ---------------------------------------------------------------- */
 /*  Boot                                                             */
 /* ---------------------------------------------------------------- */
 
 async function init() {
   buildResSeg();
   wireDbgToggle();
+  if (segNight) {
+    $$('#segNight button').forEach((b) => b.addEventListener('click', () => setNightMode(b.dataset.nv)));
+  }
+  const btnAutoTorch = $('#btnAutoTorch');
+  const renderAutoTorchBtn = () => {
+    if (!btnAutoTorch) return;
+    btnAutoTorch.classList.toggle('on', NV.torch);
+    btnAutoTorch.textContent = NV.torch ? '⌁ AUTO TORCH' : '⌁ MANUAL TORCH';
+  };
+  if (btnAutoTorch) {
+    btnAutoTorch.addEventListener('click', () => {
+      NV.torch = !NV.torch;
+      try { localStorage.setItem('secam_auto_torch', NV.torch ? '1' : '0'); } catch { /* ignore */ }
+      NV.torchIntent = null;
+      // disabling must not leave an auto-lit torch stuck on
+      if (!NV.torch && torchAuto) { torchAuto = false; setTorch(false, true); }
+      renderAutoTorchBtn();
+      syncAutoTorch();
+      toast(NV.torch ? 'Auto torch ON — flashlight fires when it gets dark' : 'Auto torch OFF', 'info', 1600);
+    });
+  }
+  renderAutoTorchBtn();
+  if (talkUnlock) {
+    talkUnlock.addEventListener('click', () => {
+      talkUnlock.classList.add('hidden');
+      if (talkAudio && talkAudio.srcObject) talkAudio.play().catch(() => { /* still blocked */ });
+    });
+  }
+  NV.timer = setInterval(() => nvTick(), 2000);
+  nvTick();
   const simBadge = document.getElementById('simBadge');
   if (simBadge) simBadge.hidden = !FAKE_MODE;
   const relayBadge = document.getElementById('relayBadge');
@@ -780,6 +1105,7 @@ async function init() {
   } catch {
     /* permission denied or no camera — user can retry via GO LIVE */
   }
+  nvTick(); // sample the real light level once the camera is live
 }
 
 init();

@@ -197,6 +197,7 @@ async function main() {
     `--user-data-dir=${profile}`,
     '--autoplay-policy=no-user-gesture-required',
     '--use-fake-ui-for-media-stream',
+    '--use-fake-device-for-media-stream',
     '--enable-unsafe-swiftshader', // software GL fallback for media encoding
     'about:blank',
   ], { stdio: 'ignore' });
@@ -392,7 +393,7 @@ async function main() {
        data channel; the phone caps its sender bitrate accordingly) */
     log('adaptive quality test…');
     const segBtns = await viewer.eval(`[...document.querySelectorAll('#segQuality button')].map(b => b.dataset.q)`);
-    check('quality control rendered', JSON.stringify(segBtns) === JSON.stringify(['auto', 'eco', 'med', 'hd']), segBtns.join(','));
+    check('quality control rendered', JSON.stringify(segBtns) === JSON.stringify(['auto', 'eco', 'med', 'hd', 'stable']), segBtns.join(','));
     check('quality AUTO by default', (await viewer.eval(`document.querySelector('#segQuality button[data-q="auto"]').classList.contains('on')`)) === true);
     // the phone's status report must reach the viewer chip via the data channel
     await waitFor(() => viewer.eval(`document.getElementById('qualityChip').textContent !== 'Q AUTO · --'`), 20000, 'quality chip populated');
@@ -431,6 +432,126 @@ async function main() {
     }, 15000, 'phone converges to the upgraded tier');
     check('healthy link recovers quality', true);
     await viewer.eval(`window.__secamQuality.forceHealth(false); 'off'`);
+
+    /* 6c2 — STABLE mode: pins the stream to the gentle SD 360p tier so a
+       weak/older WiFi adapter is never stressed into dropping. The engine
+       must stand aside completely — even a forced-healthy link may NOT
+       climb out of STABLE. */
+    log('STABLE mode test…');
+    await viewer.eval(`window.__secamQuality.setMode('stable'); 'stable'`);
+    await waitFor(async () => (await phone.eval(`window.__secam.quality.applied`)) === 1, 20000, 'phone applies STABLE tier');
+    check('STABLE pins the stream to the gentle tier', (await phone.eval(`window.__secam.quality.maxBitrate`)) === 250000, `${await phone.eval(`window.__secam.quality.maxBitrate`)} bps cap`);
+    check('STABLE chip shows on the viewer', (await viewer.eval(`document.getElementById('qualityChip').textContent`)).includes('STABLE'), await viewer.eval(`document.getElementById('qualityChip').textContent`));
+    check('STABLE is a distinct quality mode', (await viewer.eval(`window.__secamQuality.stable`)) === true);
+    // the engine must never override STABLE, however healthy the link looks
+    await viewer.eval(`window.__secamQuality.forceHealth(true); 'on'`);
+    await sleep(9000); // well past AQ_HEALTH_STREAK samples at the 2s poll
+    check('STABLE resists quality escalation', (await viewer.eval(`window.__secamQuality.tier`)) === 1, `tier=${await viewer.eval(`window.__secamQuality.tier`)}`);
+    check('STABLE keeps the phone pinned', (await phone.eval(`window.__secam.quality.applied`)) === 1);
+    await viewer.eval(`window.__secamQuality.forceHealth(false); 'off'`);
+    await viewer.eval(`document.querySelector('#segQuality button[data-q="auto"]').click(); 'auto'`);
+    check('STABLE released — back to AUTO', (await viewer.eval(`window.__secamQuality.mode`)) === 'auto');
+
+    /* 6d — night vision (auto + override), thermal vision, and the
+       talk channel (PC mic → phone speaker over a 2nd PeerJS call) */
+    log('vision + talk test…');
+    // night vision: the sim feed is dark, so AUTO should engage on both
+    // pages within a couple of 2s sampling ticks
+    try {
+      await waitFor(() => phone.eval(`document.getElementById('preview').classList.contains('nvg')`), 15000, 'phone NVG auto-on (dark sim)');
+    } catch (e) {
+      const diag = await phone.eval(`JSON.stringify(Object.assign(window.__secam.nv, {ready: document.getElementById('preview').readyState, w: document.getElementById('preview').videoWidth, paused: document.getElementById('preview').paused, live: window.__secam.live}))`);
+      console.log(`  DIAG phone NV state: ${diag}`);
+      throw e;
+    }
+    check('phone night vision auto-engages in the dark', true);
+    try {
+      await waitFor(() => viewer.eval(`document.getElementById('feed').classList.contains('nvg')`), 15000, 'viewer NVG auto-on (dark feed)');
+    } catch (e) {
+      const diag = await viewer.eval(`JSON.stringify(Object.assign(window.__secamVision, {ready: document.getElementById('feed').readyState, w: document.getElementById('feed').videoWidth, paused: document.getElementById('feed').paused, pill: document.getElementById('pill').textContent}))`);
+      console.log(`  DIAG viewer NV state: ${diag}`);
+      throw e;
+    }
+    check('viewer night vision auto-engages in the dark', true);
+    check('viewer night chip shows the AUTO mode', (await viewer.eval(`document.getElementById('nvChip').textContent`)).includes('AUTO'));
+    check('night dock control rendered', (await viewer.eval(`document.getElementById('btnNight').textContent`)).includes('NIGHT'));
+    // the sensor really samples: force bright → NVG must disengage
+    await viewer.eval(`window.__secamVision.forceLight(200); 'bright'`);
+    await waitFor(() => viewer.eval(`!document.getElementById('feed').classList.contains('nvg')`), 8000, 'NVG off in bright light');
+    check('bright light disengages night vision', true);
+    await viewer.eval(`window.__secamVision.forceLight(null); 'real'`);
+    // manual override cycle (still dark): OFF → no filter, ON → filter, AUTO → filter
+    await viewer.eval(`window.__secamVision.setNight('off'); 'off'`);
+    check('manual OFF overrides auto in the dark', (await viewer.eval(`!document.getElementById('feed').classList.contains('nvg')`)) === true);
+    await viewer.eval(`window.__secamVision.setNight('on'); 'on'`);
+    check('manual ON forces night vision', (await viewer.eval(`document.getElementById('feed').classList.contains('nvg')`)) === true);
+    await viewer.eval(`window.__secamVision.setNight('auto'); 'auto'`);
+    check('back to AUTO re-engages in the dark', (await viewer.eval(`document.getElementById('feed').classList.contains('nvg')`)) === true);
+    // the NVG filter is now the boosted SVG gamma-gain filter — a flat CSS
+    // brightness bump cannot recover detail the sensor never captured
+    const nvgF = await viewer.eval(`getComputedStyle(document.getElementById('feed')).filter`);
+    check('night vision uses the boosted gain filter', nvgF.includes('nvg'), nvgF);
+    // auto-torch: dark scene + AUTO night vision → the phone records a torch
+    // intent (the sim camera has no real LED, so we verify the decision)
+    check('auto-torch arms with night vision', (await phone.eval(`window.__secam.nv.torchIntent`)) === 'on', await phone.eval(`window.__secam.nv.torchIntent`));
+    await phone.eval(`window.__secam.setAutoTorch(false); 'off'`);
+    check('auto-torch can be disabled', (await phone.eval(`window.__secam.nv.torchIntent`)) === null);
+    await phone.eval(`window.__secam.setAutoTorch(true); 'on'`);
+    await phone.eval(`window.__secam.setNight('off'); 'off'`);
+    check('torch intent clears when night vision is off', (await phone.eval(`window.__secam.nv.torchIntent`)) === 'off');
+    await phone.eval(`window.__secam.setNight('auto'); 'auto'`);
+    // torch-hold (the flicker guard): once the auto-torch is on, the light
+    // reading is dominated by the torch's own glow — a bright reading must
+    // NOT instantly kill night vision (that would loop forever: NVG off →
+    // torch off → dark → NVG on → torch on…). Only a genuinely bright
+    // ambient (daylight) probes and disengages.
+    await phone.eval(`window.__secam.forceLight(12); '12'`); // dark → NVG engages
+    await waitFor(() => phone.eval(`document.getElementById('preview').classList.contains('nvg')`), 8000, 'phone NVG re-engaged');
+    await phone.eval(`window.__secam.debugSimTorch(true); 'torch-lit'`); // sim torch ON
+    check('auto-torch lit state simulated', (await phone.eval(`window.__secam.torchAuto`)) === true);
+    await phone.eval(`window.__secam.forceLight(60); '60'`); // torch-lit room reads 60
+    await sleep(2500); // several 2s samples
+    check('torch-lit reading alone does not kill NVG', (await phone.eval(`document.getElementById('preview').classList.contains('nvg')`)) === true);
+    await phone.eval(`window.__secam.forceLight(150); '150'`); // real daylight
+    await waitFor(() => phone.eval(`!document.getElementById('preview').classList.contains('nvg')`), 20000, 'NVG off in daylight');
+    check('real daylight disengages NVG despite auto-torch', true);
+    await phone.eval(`window.__secam.debugSimTorch(false); 'off'`);
+    await phone.eval(`window.__secam.forceLight(null); 'real'`);
+    // thermal: the LIVE auto-ranged renderer (not a static filter) — it must
+    // paint a real heat map with actual contrast onto its overlay canvas
+    await viewer.eval(`window.__secamVision.toggleThermal(); 'thermal-on'`);
+    check('thermal mode engages (live renderer)', (await viewer.eval(`window.__secamVision.thermal`)) === true && (await viewer.eval(`window.__secamVision.thRunning`)) === true);
+    check('thermal overlay canvas is live', (await viewer.eval(`document.getElementById('thermalCanvas').classList.contains('on')`)) === true);
+    check('thermal stands night vision aside', (await viewer.eval(`!document.getElementById('feed').classList.contains('nvg')`)) === true);
+    const thPx = await waitFor(async () => {
+      const p = JSON.parse(await viewer.eval(`(function(){const c=document.getElementById('thermalCanvas');if(!c.width)return null;const d=c.getContext('2d').getImageData(0,0,c.width,c.height).data;let max=0,min=255;for(let i=0;i<d.length;i+=4){const l=0.299*d[i]+0.587*d[i+1]+0.114*d[i+2];if(l>max)max=l;if(l<min)min=l;}return JSON.stringify({w:c.width,min:Math.round(min),max:Math.round(max)});})()`));
+      return p.w > 0 && p.max > p.min + 20 ? p : null;
+    }, 10000, 'thermal heat map painted');
+    check('thermal renders a live auto-ranged heat map', true, `min=${thPx.min} max=${thPx.max}`);
+    const thScaleTxt = await viewer.eval(`document.getElementById('thScale').textContent`);
+    check('thermal REL HEAT scale populated', thScaleTxt.includes('HEAT') && thScaleTxt.includes('--') === false, thScaleTxt.replace(/\s+/g, ' '));
+    // the contrasty sim scene must show HOT/COLD markers (real range >> noise)
+    check('thermal shows HOT/COLD markers on a contrasty scene', (await viewer.eval(`window.__secamVision.thDiag.markers`)) === true, `realRange=${await viewer.eval(`window.__secamVision.thDiag.realRange`)}`);
+    // flat-scene guard (the blank/flying-markers bug): a near-uniform frame
+    // must map onto the centred minimum band instead of stretching noise
+    const thRng = await viewer.eval(`window.__secamVision.thRange(6, 7)`);
+    check('flat scenes get a minimum contrast floor', thRng.span === 24 && thRng.lo < 6 && thRng.hi > 7, JSON.stringify(thRng));
+    await viewer.eval(`window.__secamVision.toggleThermal(); 'thermal-off'`);
+    check('thermal toggles off cleanly', (await viewer.eval(`window.__secamVision.thermal`)) === false && (await viewer.eval(`!document.getElementById('thermalCanvas').classList.contains('on')`)) === true);
+    // talk: viewer mic → second PeerJS call → phone speaker
+    await viewer.eval(`(async function(){ await window.__secamTalk.toggle(); return 'talk-on'; })()`);
+    check('viewer talk armed', (await viewer.eval(`window.__secamTalk.on`)) === true);
+    await waitFor(async () => (await viewer.eval(`window.__secamTalk.callActive`)) ? true : null, 20000, 'talk channel established');
+    check('talk channel established (2nd PeerJS call)', true);
+    const senders = await viewer.eval(`JSON.stringify(window.__secamTalk.audioTracks)`);
+    check('viewer mic track is live on the talk call', senders.includes('live'), senders);
+    await waitFor(() => phone.eval(`window.__secam.talkActive`), 30000, 'phone plays the viewer mic');
+    check('phone plays the viewer mic on its speaker', true);
+    check('phone TALK chip lights up', (await phone.eval(`document.getElementById('talkChip').textContent`)) === 'TALK ●');
+    await viewer.eval(`(async function(){ await window.__secamTalk.toggle(); return 'talk-off'; })()`);
+    check('viewer talk disarmed', (await viewer.eval(`window.__secamTalk.on`)) === false);
+    await waitFor(() => phone.eval(`!window.__secam.talkActive`), 20000, 'phone talk playback stops');
+    check('phone stops playback when talk is off', true);
 
     /* 7 — event log + console errors */
     const dumpLog = async (session, label) => {

@@ -10,7 +10,10 @@ Turn your **phone** into a security camera: your phone captures **video + audio*
 - 🌍 **Internet relay** — serve the pages from a public URL (e.g. a Cloudflare quick tunnel) and the app auto-switches to relay mode: the QR/link becomes an internet link and video can flow through a free TURN relay when direct P2P fails, so you can watch from anywhere.
 - 📶 **Offline-ready** — a service worker caches the whole app, so the phone page opens with **zero connectivity** and waits for the PC; when offline, external STUN/TURN is skipped so LAN links connect instantly (no internet needed).
 - ⏳ **Dropout buffering** — when the signal dips, the viewer **freezes the last frame** under a “SIGNAL LOST — RECONNECTING” countdown instead of dropping to standby, while the phone's auto-reconnect re-links; a new call resumes seamlessly (and an active recording rolls onto the new feed).
-- 📉 **Adaptive quality** — on poor links the viewer measures loss/jitter/latency/bandwidth every 2s and automatically steps the stream down (1080p → 240p, bitrate-capped) to keep it watchable, then steps back up when the link recovers. Manual **QUALITY** control: AUTO / ECO / MED / HD.
+- 📉 **Adaptive quality** — on poor links the viewer measures loss/jitter/latency/bandwidth every 2s and automatically steps the stream down (HD 720p → 240p, bitrate-capped) to keep it watchable, then steps back up when the link recovers. Manual **QUALITY** control: AUTO / ECO / MED / **🛡 STABLE** (pins the stream to a gentle 360p / 250 kbps so weak WiFi adapters never drop) / HD.
+- 🌙 **Night vision** — the feed's luminance is sampled every 2s and a phosphor-green night-vision filter **auto-engages when it gets dark** (on both the phone's preview and the PC viewer). A strong gamma-gain curve lifts shadows ~4×, and **⌁ AUTO TORCH** fires the phone's flashlight whenever night vision is on — so it can actually see in a pitch-black room. Manual override: **NIGHT AUTO / ON / OFF**.
+- ♨ **Thermal vision** — one click switches to a **live auto-ranging** thermal-style renderer: ironbow palette, temporal smoothing, HOT/COLD spot markers and a live **REL HEAT** scale — it behaves like a thermal cam's auto-contrast instead of a fixed colour overlay. Snapshots capture whatever mode you're viewing.
+- 🗣 **Talk-back** — hit **◉ TALK** on the viewer and your PC mic plays through the **phone's speaker** (a second PeerJS call, PIN-gated) — say “move the camera”, or use it as a two-way intercom.
 - 📼 **Built-in recorder** — record the feed to `.webm`, grab snapshots, PiP, fullscreen.
 - 🖥️ **Neon surveillance HUD** — scanlines, radar, corner brackets, live RTT/FPS telemetry, battery + torch controls on the phone unit.
 
@@ -141,17 +144,30 @@ without renegotiation, so there's no freeze-frame during the switch):
 | Tier | Size | FPS | Bitrate cap |
 |---|---|---|---|
 | ECO | 240p | 12 | 120 kbps |
-| SD | 360p | 15 | 250 kbps |
+| SD (STABLE) | 360p | 15 | 250 kbps |
 | MED | 480p | 18 | 500 kbps |
 | HD | 720p | 24 | 1.1 Mbps |
-| (auto-only) | 1080p | 24 | 2.5 Mbps |
+| (reserved — not selectable) | 1080p | 24 | 2.5 Mbps |
 
 When the link recovers it steps back up. You can override the engine with the
 **QUALITY** control in the viewer dock: **AUTO** (recommended), **ECO** (max
-battery/data savings), **MED**, or **HD**. The phone shows its current tier in
-the `Q` chip; the viewer shows `Q AUTO · SD 480p` and a live **BW** chip
-(bandwidth + loss %). The frame-stall watchdog also gives a known-poor link
-extra grace so a congestion hiccup isn't mistaken for a dead camera.
+battery/data savings), **MED**, **HD**, or **🛡 STABLE** (key `G`).
+
+**🛡 STABLE mode** is the fix for the worst case — a WiFi adapter that
+*literally switches off* under load (see Troubleshooting). It pins the stream
+to SD 360p at a 250 kbps cap and *completely disables* the adaptive engine, so
+the adapter is never hit with a sustained high-bitrate burst again. It's the
+first thing to try when the link keeps dying: one click in the QUALITY control.
+
+The AUTO engine is also gentler by default than it used to be: it starts at
+**SD 480p** (not HD), the phone is **bitrate-capped from the very first
+frame** (no uncapped startup burst), and the engine never escalates past
+**HD 720p** — the 1080p tier is intentionally unreachable (neither AUTO nor
+any manual mode selects it), so a multi-Mbps burst can never be demanded
+from a weak link. The phone shows its current tier in the `Q` chip; the
+viewer shows `Q AUTO · SD 480p` and a live **BW** chip (bandwidth + loss %).
+The frame-stall watchdog also gives a known-poor link extra grace so a
+congestion hiccup isn't mistaken for a dead camera.
 
 ### A brief dropout doesn't kill the view
 
@@ -165,6 +181,82 @@ range), the viewer falls back to STANDBY after ~45s. Pressing **STOP** on the
 phone tells the viewer *not* to buffer (via a quick data-channel signal), so
 an intentional stop still goes straight to standby. If you're recording during
 a dropout, the recording rolls onto the re-linked feed automatically.
+
+### Night vision, thermal vision & talk-back
+
+- **🌙 Night vision (auto)** — both pages sample their own feed's mean
+  luminance every 2s (an 8×6 canvas read, so the brightened NVG image can't
+  feed back into the sensor and flicker). Below the darkness threshold the
+  classic phosphor-green filter engages automatically; hysteresis keeps it
+  stable at dusk. Override per page with **☾ NIGHT AUTO / ON / OFF** on the
+  viewer dock (key `V`) or the phone's NIGHT control. The phone preview and
+  the PC feed decide independently — since they watch the same scene they
+  switch together, and either side can be overridden without affecting the
+  other.
+
+  > **Why was the screen still black in a dark room?** Night vision here is
+  > a **software gain** — it amplifies whatever light the sensor captured.
+  > In a *completely* dark room with no light at all, there is no signal to
+  > amplify: the filter shows only sensor noise (this is physics, not a bug
+  > — real night-vision cameras carry their own IR illuminator). Two things
+  > fix this, both built in:
+  >
+  > 1. **⌁ AUTO TORCH** (phone unit, on by default) — the moment night
+  >    vision engages (automatically in the dark, or forced ON), the phone's
+  >    **flashlight switches on by itself** to light the scene, and switches
+  >    back off when the light level recovers. This is your illuminator —
+  >    for a fixed camera a phone LED lights a room surprisingly well. It
+  >    never fights a torch you set by hand.
+  > 2. **Boosted gain curve** — the old flat `brightness(1.6)` CSS bump
+  >    could barely lift a dim scene; the new SVG **gamma-gain** filter
+  >    lifts shadows ~4× while keeping highlights intact, so low-light
+  >    detail that *is* captured becomes readable.
+  >
+  > Practical tips: keep the phone a few metres from the subject, and give
+  > the camera a second or two to auto-adjust its exposure after the torch
+  > switches on. If the room is pitch black *and* the phone has no flash,
+  > no camera app can see anything — add a small light or IR lamp.
+  >
+  > The auto-torch also has a **flicker guard**: because the torch lights
+  > the very frame the sensor reads, the app won't trust a bright reading
+  > while the torch is on — it requires the brightness to persist for
+  > several samples and then probes the true ambient light (torch briefly
+  > off) before switching the torch back off in the morning. So the torch
+  > stays on all night in a dark room instead of pulsing on and off.
+- **♨ Thermal vision (live, auto-ranged)** — the viewer dock's **THERMAL**
+  button (key `H`) switches to a real-time thermal-*style* renderer that
+  behaves like a thermal camera instead of a fixed colour overlay. ~8×/s it
+  samples the feed's brightness and:
+  - **auto-ranges** the live min→max of each frame onto the ironbow palette
+    (deep blue → magenta → orange → yellow → white) — the full colour scale
+    is always in use, so dark scenes don't wash to blue and bright/warm
+    sources pop (like a real cam's auto-contrast);
+  - **temporally smooths** the map, so hot spots glow steadily instead of
+    flickering frame-to-frame;
+  - **marks the hottest and coolest spots** with HOT/COLD reticles;
+  - shows a live **REL HEAT** scale (bottom-right) with the current range.
+  Night vision stands aside while it runs, and snapshots capture the heat
+  map.
+  Flat-scene handling: if the frame has almost no brightness range (a blank
+  wall, a dim uniform room), the renderer shows a **FLAT SCENE** note and
+  maps the scene onto a minimum-contrast band instead of stretching sensor
+  noise — so it never looks blank or sprints HOT/COLD markers across the
+  screen. Point it at something with contrast (a person, a lamp, a window)
+  to see the heat structure.
+  Honest note: a phone camera senses **visible light, not heat** — this
+  maps *brightness* (it's excellent for picking out bright sources and
+  contrast, but it cannot read real temperatures). True thermal imaging
+  needs a thermal sensor — e.g. a FLIR ONE-style attachment — and the
+  renderer is the closest software-only approximation a phone can do.
+- **🗣 Talk-back (PC → phone)** — press **◉ TALK** on the viewer (key `T`,
+  requires a live stream; your PC mic is requested then). Your voice is sent
+  over a **second PIN-gated PeerJS call** and plays through the **phone's
+  speaker** — the phone shows a green **TALK ●** chip while you speak. Toggle
+  again (or STOP the link) to hang up. It's sticky: if the link drops and
+  re-links, the camera keeps hearing you. If the phone browser blocks
+  autoplay, a “TAP TO ENABLE VIEWER AUDIO” button appears. This is
+  speakerphone-style, so keep the phone's volume moderate to avoid feedback
+  into its own mic.
 
 ## How it works
 
@@ -186,8 +278,9 @@ a dropout, the recording rolls onto the re-linked feed automatically.
 | Phone unit | Viewer |
 |---|---|
 | ⇄ flip camera · ⌁ torch · ◉ mic mute | ▣ snapshot · ● record · ⧉ PiP · ⛶ fullscreen · mute |
-| CAM / MIC device pickers · Q quality chip | ◈ motion detect · ♪ beep · SENS slider · QUALITY AUTO/ECO/MED/HD |
-| RES: 480p / 720p / 1080p (capture ceiling) | live telemetry: resolution, FPS, RTT, BW + loss, Q tier |
+| CAM / MIC device pickers · Q quality chip | ◈ motion detect · ♪ beep · SENS slider · QUALITY AUTO/ECO/MED/HD/STABLE (key G) |
+| NIGHT AUTO/ON/OFF · ⌁ AUTO TORCH · ☾ NIGHT chip · TALK ● chip | ☾ NIGHT AUTO/ON/OFF · ♨ THERMAL · ◉ TALK (keys V / H / T) |
+| RES: 480p / 720p / 1080p (capture ceiling) | live telemetry: resolution, FPS, RTT, BW + loss, Q tier, ☾ NIGHT |
 | offline badge · WAITING mode | OFFLINE badge · SW-cached app shell |
 
 ## Motion detection
@@ -212,14 +305,36 @@ blocks over the video, plus:
 - **No video but audio works / camera black** → your PC firewall may be blocking the peer connection; allow Node.js through, or try the 480p resolution.
 - **Port in use** → set another port: `PORT=4443 npm start`.
 - **Wrong PIN toast on viewer** → the phone must type the exact 4-digit PIN shown on the viewer screen.
+- **The PC's WiFi switches off and the link drops** → the adapter (or its
+driver) is crashing under the sustained video stream — a known behaviour on
+many Realtek / Intel / combo WiFi+Bluetooth cards. Fixes, in order of
+likelihood:
+  1. Click **🛡 STABLE** in the viewer's QUALITY control (or press `G`) — the
+     stream drops to 360p / 250 kbps, usually low enough to keep the adapter
+     alive. This alone fixes most cases.
+  2. **Update the WiFi driver** (Realtek especially — grab the latest from the
+     laptop/adaptor vendor, not Windows Update).
+  3. **Disable power-saving on the adapter**: Device Manager → Network
+     adapters → your WiFi → Properties → *Power Management* → untick
+     **"Allow the computer to turn off this device to save power"**.
+  4. Also disable *WiFi power saving* under Control Panel → Power Options →
+     *Change plan settings* → *Change advanced power settings* → *Wireless
+     Adapter Settings* → set to **Maximum Performance**.
+  5. **Turn off Bluetooth** if your card is a WiFi+BT combo — a flaky BT link
+     on the same antenna is a common cause of adapter resets under load.
+  6. Prefer the **5 GHz** band (2.4 GHz has less capacity and is more prone to
+     interference); move the PC closer to the router.
+  7. A USB WiFi dongle or an **Ethernet cable** sidesteps the problem entirely.
 - **Feed connects, then drops again** → the phone now **auto-reconnects**: when a live link drops it retries GO LIVE itself (watch the pill turn RECONNECTING; up to 10 attempts with growing delays, ~3 minutes). If it gives up, the viewer page may be closed — reopen it and the next retry... otherwise press GO LIVE once the viewer is back. For real drop causes, open the **LOG** drawer (bottom-right of either page) and look for `ice` / `rtc` / `call close` lines. Keep the phone tab foregrounded and the screen awake (wake lock is requested while live); if the phone's Wi-Fi drops, the media dies with it until the network returns.
 - **Connect is slow / "finally connects"** → if the phone can't reach Google's STUN server, ICE gathering waits for timeouts (~10s). Both devices on the same Wi-Fi usually connect fine without it; you can point `iceServers` at your router if needed. If you're offline (or on a LAN with no internet), the app now detects it and skips STUN entirely — instant host-only connection.
 - **Phone shows WAITING** → the PC/server isn't reachable right now (offline phone, PC asleep). The camera retries every 15s and auto-links when the PC comes back; press GO LIVE to retry immediately.
 - **Viewer shows SIGNAL LOST / RECONNECTING** → a network blip dropped the link; the viewer is holding the last frame and waiting for the phone to re-link automatically (up to ~45s). If it stays like that, the phone is really gone — it will drop to STANDBY and pick up again when the phone returns.
 - **Viewer stays LIVE after STOP on the phone** → the phone's signaling socket can silently drop (idle, iOS backgrounding), so its STOP message is lost. The viewer now auto-detects a vanished link via ICE within ~8s and drops to STANDBY on its own — the phone's auto-reconnect will re-link when you GO LIVE again.
+- **Night vision shows nothing in the dark** → the gain filter can only amplify light the sensor actually captured. If the room is pitch black, the phone's torch must be on — **⌁ AUTO TORCH** (default on) fires it automatically when night vision engages. If you disabled it, or the camera has no flash, no software can see in total darkness: add a light or an IR lamp.
 
 ## Roadmap ideas
 
 - Record directly to disk on the PC server
 - Multiple camera units on one viewer
-- Night-vision (brightness/gain boost) toggle
+- Two-way voice (phone → PC) already flows; add a PC-side echo-cancelled intercom mode
+- Real IR illumination: keep the phone torch on automatically when night vision engages
